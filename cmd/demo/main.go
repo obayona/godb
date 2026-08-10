@@ -24,10 +24,17 @@ func main() {
 	}()
 
 	statements := []string{
-		`create table users (id int, name bytes, primary key (id))`,
-		`insert into users (id, name) values (1, 'Ada')`,
-		`insert into users (id, name) values (2, 'Grace')`,
-		`delete from users index by id = 1`,
+		`create table users (id int, name bytes, email bytes, age int, primary key (id), index (email), index (age))`,
+		`insert into users (id, name, email, age) values (1, 'Ada', 'ada@example.com', 36)`,
+		`insert into users (id, name, email, age) values (2, 'Grace', 'grace@example.com', 28)`,
+		`insert into users (id, name, email, age) values (3, 'Linus', 'linus@example.com', 33)`,
+		// Uses the secondary email index automatically.
+		`select id, name from users filter email = 'grace@example.com'`,
+		// Uses the secondary age index as a bounded range.
+		`select id, name, age from users filter age >= 30 and age < 40`,
+		// Computed predicates are correct via the full-scan fallback.
+		`select id, name from users filter name + '!' = 'Ada!'`,
+		`delete from users filter id = 1`,
 		`select id, name from users`,
 	}
 

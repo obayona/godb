@@ -221,74 +221,6 @@ func qlEval(ctx *QLEvalContex, node QLNode) {
 	}
 }
 
-// convert `INDEX BY` to `table.Record` and `CMP_??`
-func qlEvalScanKey(node QLNode) (table.Record, int, error) {
-	cmp := 0
-	switch node.Type {
-	case QL_CMP_GE:
-		cmp = btree.CMP_GE
-	case QL_CMP_GT:
-		cmp = btree.CMP_GT
-	case QL_CMP_LT:
-		cmp = btree.CMP_LT
-	case QL_CMP_LE:
-		cmp = btree.CMP_LE
-	case QL_CMP_EQ:
-		cmp = 0 // later
-	case 0:
-		return table.Record{}, 0, nil // non-existent; handled later
-	default:
-		panic("unreachable")
-	}
-	names, exprs := node.Kids[0], node.Kids[1]
-	utils.Assert(names.Type == QL_TUP && exprs.Type == QL_TUP)
-	utils.Assert(len(names.Kids) == len(exprs.Kids))
-
-	vals, err := qlEvelMulti(table.Record{}, exprs.Kids)
-	if err != nil {
-		return table.Record{}, 0, err
-	}
-	cols := []string{}
-	for i := range names.Kids {
-		utils.Assert(names.Kids[i].Type == QL_SYM)
-		cols = append(cols, string(names.Kids[i].Str))
-	}
-	return table.Record{cols, vals}, cmp, nil
-}
-
-// create the `table.Scanner` from the `INDEX BY` clause
-func qlScanInit(req *QLScan, sc *table.Scanner) (err error) {
-	// convert `QLNode` to `table.Record` and `CMP_??`
-	if sc.Key1, sc.Cmp1, err = qlEvalScanKey(req.Key1); err != nil {
-		return err
-	}
-	if sc.Key2, sc.Cmp2, err = qlEvalScanKey(req.Key2); err != nil {
-		return err
-	}
-	// convert keys to a range
-	switch {
-	case req.Key1.Type == 0 && req.Key2.Type == 0:
-		// no `INDEX BY`; full table scan by the primary key
-		sc.Cmp1, sc.Cmp2 = btree.CMP_GE, btree.CMP_LE // compare with infinity
-	case req.Key1.Type == QL_CMP_EQ && req.Key2.Type == 0:
-		// equal by a prefix: INDEX BY key = val
-		sc.Key2 = sc.Key1
-		sc.Cmp1, sc.Cmp2 = btree.CMP_GE, btree.CMP_LE
-	case req.Key1.Type != 0 && req.Key2.Type == 0:
-		// open-ended range: INDEX BY key > val
-		if sc.Cmp1 > 0 {
-			sc.Cmp2 = btree.CMP_LE // compare with a zero-length tuple
-		} else {
-			sc.Cmp2 = btree.CMP_GE
-		}
-	case req.Key1.Type != 0 && req.Key2.Type != 0:
-		// two-side range: INDEX BY val1 < key AND key < val2
-	default:
-		panic("unreachable")
-	}
-	return nil
-}
-
 type RecordIter interface {
 	Valid() bool
 	Next()
@@ -359,7 +291,11 @@ func (iter *qlScanIter) Deref(rec *table.Record) error {
 // execute a query
 func qlScan(req *QLScan, tx *table.DBTX) (RecordIter, error) {
 	iter := qlScanIter{req: req}
-	if err := qlScanInit(req, &iter.sc); err != nil {
+	tdef := table.GetTableDef(tx, req.Table)
+	if tdef == nil {
+		return nil, fmt.Errorf("table not found: %s", req.Table)
+	}
+	if err := qlScanInit(req, tdef, &iter.sc); err != nil {
 		return nil, err
 	}
 	if err := tx.Scan(req.Table, &iter.sc); err != nil {

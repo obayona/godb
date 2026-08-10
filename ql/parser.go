@@ -54,11 +54,9 @@ type QLCreateTable struct {
 	Def table.TableDef
 }
 
-// common structure for queries: `INDEX BY`, `FILTER`, `LIMIT`
+// common structure for queries: `FILTER`, `LIMIT`
 type QLScan struct {
 	Table  string // table name
-	Key1   QLNode // index by
-	Key2   QLNode
 	Filter QLNode // filter
 	Offset int64  // limit
 	Limit  int64
@@ -308,7 +306,7 @@ func pSelect(p *Parser) *QLSelect {
 	// FROM table
 	pExpect(p, "from", "expect `FROM` table")
 	stmt.Table = pMustSym(p)
-	// INDEX BY xxx FILTER yyy LIMIT zzz
+	// FILTER yyy LIMIT zzz
 	pScan(p, &stmt.QLScan)
 	return &stmt
 }
@@ -336,10 +334,6 @@ func pSelectExpr(p *Parser, node *QLSelect) {
 }
 
 func pScan(p *Parser, node *QLScan) {
-	// INDEX BY ...
-	if pKeyword(p, "index", "by") {
-		pIndexBy(p, node)
-	}
 	// FILTER condition
 	if pKeyword(p, "filter") {
 		pExprOr(p, &node.Filter)
@@ -349,54 +343,6 @@ func pScan(p *Parser, node *QLScan) {
 	if pKeyword(p, "limit") {
 		pLimit(p, node)
 	}
-}
-
-func pIndexBy(p *Parser, node *QLScan) {
-	// INDEX BY cols < vals
-	// INDEX BY cols < vals AND cols > vals
-	index := QLNode{}
-	pExprAnd(p, &index)
-	if index.Type == QL_AND {
-		node.Key1, node.Key2 = index.Kids[0], index.Kids[1]
-	} else {
-		node.Key1 = index
-	}
-	pVerifyScanKey(p, &node.Key1)
-	if node.Key2.Type != 0 {
-		pVerifyScanKey(p, &node.Key2)
-	}
-	if node.Key1.Type == QL_CMP_EQ && node.Key2.Type != 0 {
-		pErr(p, "bad `INDEX BY`: expect only a single `=`")
-	}
-}
-
-func pVerifyScanKey(p *Parser, node *QLNode) {
-	switch node.Type {
-	case QL_CMP_EQ, QL_CMP_GE, QL_CMP_GT, QL_CMP_LT, QL_CMP_LE:
-	default:
-		pErr(p, "bad `INDEX BY`: not a comparison")
-		return
-	}
-
-	left, right := node.Kids[0], node.Kids[1]
-	if left.Type != QL_TUP && right.Type != QL_TUP {
-		left = QLNode{Value: table.Value{Type: QL_TUP}, Kids: []QLNode{left}}
-		right = QLNode{Value: table.Value{Type: QL_TUP}, Kids: []QLNode{right}}
-	}
-	if left.Type != QL_TUP || right.Type != QL_TUP {
-		pErr(p, "bad `INDEX BY`: bad comparison")
-	}
-	if len(left.Kids) != len(right.Kids) {
-		pErr(p, "bad `INDEX BY`: bad comparison")
-	}
-
-	for _, name := range left.Kids {
-		if name.Type != QL_SYM {
-			pErr(p, "bad `INDEX BY`: expect column name")
-		}
-	}
-
-	node.Kids[0], node.Kids[1] = left, right
 }
 
 func pLimit(p *Parser, node *QLScan) {
@@ -529,7 +475,6 @@ func pExprAtom(p *Parser, node *QLNode) {
 
 var pKeywordSet = map[string]bool{
 	"from":   true,
-	"index":  true,
 	"filter": true,
 	"limit":  true,
 }

@@ -30,6 +30,11 @@ go run ./cmd/demo
 The demo creates a table, inserts rows, deletes one row, and selects the
 remaining data.
 
+Queries use `FILTER` predicates without an index hint. The query layer chooses
+an index for simple equality and range predicates when a leading index prefix
+matches; computed, ambiguous, and otherwise unsupported predicates fall back
+to a full primary-index scan.
+
 The linked-leaf format uses the database signature `GoDBLinkedLeaf01` and is
 not binary-compatible with database files produced by the earlier node
 format.
