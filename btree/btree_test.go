@@ -1,458 +1,231 @@
 package btree
 
 import (
-	"encoding/binary"
-	"slices"
-	"strings"
+	"fmt"
+	"math/rand"
+	"sort"
 	"testing"
+	"unsafe"
+
+	"github.com/obayona/godb/utils"
+	is "github.com/stretchr/testify/require"
 )
 
-func TestBType(t *testing.T) {
-	// create a byte slice representing node
-	// | 1  | ... | type node
-	// | 2B | ....|
-	buff := make([]byte, 2)
-	binary.LittleEndian.PutUint16(buff, BNODE_NODE)
-	bNode := BNode(buff)
+type C struct {
+	tree  BTree
+	ref   map[string]string
+	pages map[uint64]BNode
+}
 
-	if size := bNode.btype(); size != BNODE_NODE {
-		t.Errorf("Expected: %v; got: %v", BNODE_NODE, size)
-	}
-
-	// create a byte slice representing node
-	// | 2  | ... | type node
-	binary.LittleEndian.PutUint16(buff, BNODE_LEAF)
-	bNode = BNode(buff)
-
-	if size := bNode.btype(); size != BNODE_LEAF {
-		t.Errorf("Expected: %v; got: %v", BNODE_LEAF, size)
+func newC() *C {
+	pages := map[uint64]BNode{}
+	return &C{
+		tree: BTree{
+			GetPage: func(ptr uint64) []byte {
+				node, ok := pages[ptr]
+				utils.Assert(ok)
+				return node
+			},
+			NewPage: func(node []byte) uint64 {
+				utils.Assert(BNode(node).NBytes() <= BTREE_PAGE_SIZE)
+				ptr := uint64(uintptr(unsafe.Pointer(&node[0])))
+				utils.Assert(pages[ptr] == nil)
+				pages[ptr] = node
+				return ptr
+			},
+			DelPage: func(ptr uint64) {
+				utils.Assert(pages[ptr] != nil)
+				delete(pages, ptr)
+			},
+		},
+		ref:   map[string]string{},
+		pages: pages,
 	}
 }
 
-func TestNKeys(t *testing.T) {
-	// create a byte slice representing node with 6 keys
-	// | .. | 6  | ....
-	// | 2B | 2B | ...
-	buff := make([]byte, 4)
-	binary.LittleEndian.PutUint16(buff[2:], 6)
-	bNode := BNode(buff)
-
-	if nkeys := bNode.nkeys(); nkeys != 6 {
-		t.Errorf("Expected: %v; got: %v", 6, nkeys)
-	}
+func (c *C) add(key string, val string) {
+	_, err := c.tree.Upsert([]byte(key), []byte(val))
+	utils.Assert(err == nil)
+	c.ref[key] = val
 }
 
-func TestGetPtr(t *testing.T) {
-	// create a byte slice representing node
-	// | 1 | 3 | (pointers) 4 | 13 | 15 | ...
+func (c *C) del(key string) bool {
+	delete(c.ref, key)
+	deleted, err := c.tree.Delete(&DeleteReq{Key: []byte(key)})
+	utils.Assert(err == nil)
+	return deleted
+}
 
-	ptrs := []uint64{4, 13, 15}
-	bNode := createTestBNodeRaw(BNODE_LEAF, 3, ptrs, make([]uint16, 3), make([]KV, 3))
+func (c *C) dump() ([]string, []string) {
+	keys := []string{}
+	vals := []string{}
 
-	tests := []struct {
-		Name     string
-		Index    uint16
-		Expected uint64
-	}{
-		{"Ptr index 0", 0, 4},
-		{"Ptr index 1", 1, 13},
-		{"Ptr index 2", 2, 15},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			if got := bNode.getPtr(tt.Index); got != tt.Expected {
-				t.Errorf("Expected: %v; got: %v", tt.Expected, got)
+	var nodeDump func(uint64)
+	nodeDump = func(ptr uint64) {
+		node := BNode(c.tree.GetPage(ptr))
+		nkeys := node.NKeys()
+		if node.BType() == BNODE_LEAF {
+			for i := uint16(0); i < nkeys; i++ {
+				keys = append(keys, string(node.GetKey(i)))
+				vals = append(vals, string(node.GetVal(i)))
 			}
-		})
-	}
-}
-
-func TestSetPtr(t *testing.T) {
-	// create a byte slice representing node
-	// | 1 | 3 | (pointers) 4 | 13 | 15 | ...
-	ptrs := []uint64{4, 13, 15}
-	bNode := createTestBNodeRaw(BNODE_LEAF, 3, ptrs, make([]uint16, 3), make([]KV, 3))
-
-	newPtrs := []uint64{10, 12, 18}
-	for idx, ptr := range newPtrs {
-		bNode.setPtr(uint16(idx), ptr)
-		if got := bNode.getPtr(uint16(idx)); got != ptr {
-			t.Errorf("Expected: %v; got: %v", ptr, got)
+		} else {
+			for i := uint16(0); i < nkeys; i++ {
+				ptr := node.GetPtr(i)
+				nodeDump(ptr)
+			}
 		}
 	}
+
+	nodeDump(c.tree.Root)
+	utils.Assert(keys[0] == "")
+	utils.Assert(vals[0] == "")
+	return keys[1:], vals[1:]
 }
 
-func TestGetOffset(t *testing.T) {
-	// create a byte slice representing node
-	// | 1 | 3 | .. | .. | .. | 4 | 8 | 12 | ......
-	offsets := []uint16{4, 8, 12}
-	bNode := createTestBNodeRaw(BNODE_LEAF, 3, make([]uint64, 3), offsets, make([]KV, 3))
+func (c *C) verify(t *testing.T) {
+	keys, vals := c.dump()
 
-	tests := []struct {
-		Name     string
-		Index    uint16
-		Expected uint16
-	}{
-		{"Offset index 0", 0, 0},
-		{"Offset index 1", 1, 4},
-		{"Offset index 2", 2, 8},
-		{"Offset index 2", 3, 12},
+	rkeys, rvals := []string{}, []string{}
+	for k, v := range c.ref {
+		rkeys = append(rkeys, k)
+		rvals = append(rvals, v)
 	}
+	is.Equal(t, len(rkeys), len(keys))
+	sort.Stable(utils.SortAdapter{
+		Length:   len(rkeys),
+		LessFunc: func(i, j int) bool { return rkeys[i] < rkeys[j] },
+		SwapFunc: func(i, j int) {
+			k, v := rkeys[i], rvals[i]
+			rkeys[i], rvals[i] = rkeys[j], rvals[j]
+			rkeys[j], rvals[j] = k, v
+		},
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			if got := bNode.getOffset(tt.Index); got != tt.Expected {
-				t.Errorf("Expected: %v; got: %v", tt.Expected, got)
-			}
-		})
-	}
-}
+	is.Equal(t, rkeys, keys)
+	is.Equal(t, rvals, vals)
 
-func TestSetOffset(t *testing.T) {
-	// create a byte slice representing node
-	// | 1 | 3 | .. | .. | .. | 4 | 8 | 12 | ......
-	offsets := []uint16{4, 8, 12}
-	bNode := createTestBNodeRaw(BNODE_LEAF, 3, make([]uint64, 3), offsets, make([]KV, 3))
-
-	newOffsets := []uint16{0, 7, 13, 17}
-
-	for idx, offset := range newOffsets {
-		bNode.setOffset(uint16(idx), offset)
-		if got := bNode.getOffset((uint16(idx))); got != offset {
-			t.Errorf("Expected: %v; got: %v", offset, got)
+	var nodeVerify func(BNode)
+	nodeVerify = func(node BNode) {
+		nkeys := node.NKeys()
+		utils.Assert(nkeys >= 1)
+		if node.BType() == BNODE_LEAF {
+			return
+		}
+		for i := uint16(0); i < nkeys; i++ {
+			key := node.GetKey(i)
+			kid := BNode(c.tree.GetPage(node.GetPtr(i)))
+			is.Equal(t, key, kid.GetKey(0))
+			nodeVerify(kid)
 		}
 	}
+
+	nodeVerify(c.tree.GetPage(c.tree.Root))
 }
 
-func TestKvPos(t *testing.T) {
-	// create a byte slice representing node
-	// | 1 | 3 | .. | .. | .. | 4 | 8 | 12 | ...
-	offsets := []uint16{4, 8, 12}
-	bNode := createTestBNodeRaw(BNODE_LEAF, 3, make([]uint64, 3), offsets, make([]KV, 3))
+func commonTestBasic(t *testing.T, hasher func(uint32) uint32) {
+	c := newC()
+	c.add("k", "v")
+	c.verify(t)
 
-	tests := []struct {
-		Name     string
-		Index    uint16
-		Expected uint16
-	}{
-		{"Ptr index 0", 0, 34},
-		{"Ptr index 1", 1, 38},
-		{"Ptr index 2", 2, 42},
-		{"Ptr index 2", 3, 46},
+	// insert
+	for i := 0; i < 250000; i++ {
+		key := fmt.Sprintf("key%d", hasher(uint32(i)))
+		val := fmt.Sprintf("vvv%d", hasher(uint32(-i)))
+		c.add(key, val)
+		if i < 2000 {
+			c.verify(t)
+		}
+	}
+	c.verify(t)
+
+	// del
+	for i := 2000; i < 250000; i++ {
+		key := fmt.Sprintf("key%d", hasher(uint32(i)))
+		is.True(t, c.del(key))
+	}
+	c.verify(t)
+
+	// overwrite
+	for i := 0; i < 2000; i++ {
+		key := fmt.Sprintf("key%d", hasher(uint32(i)))
+		val := fmt.Sprintf("vvv%d", hasher(uint32(+i)))
+		c.add(key, val)
+		c.verify(t)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			if got := bNode.kvPos(tt.Index); got != tt.Expected {
-				t.Errorf("Expected: %v; got: %v", tt.Expected, got)
-			}
-		})
+	is.False(t, c.del("kk"))
+
+	for i := 0; i < 2000; i++ {
+		key := fmt.Sprintf("key%d", hasher(uint32(i)))
+		is.True(t, c.del(key))
+		c.verify(t)
 	}
+
+	c.add("k", "v2")
+	c.verify(t)
+	c.del("k")
+	c.verify(t)
+
+	// the dummy empty key
+	is.Equal(t, 1, len(c.pages))
+	is.Equal(t, uint16(1), BNode(c.tree.GetPage(c.tree.Root)).NKeys())
 }
 
-func TestGetKey(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("abc"), Value: []byte("cd")}, {Key: []byte("vw"), Value: []byte("yz")},
-	}
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-
-	tests := []struct {
-		Name     string
-		Index    uint16
-		Expected string
-	}{
-		{"Key index 0", 0, "abc"},
-		{"Key index 1", 1, "vw"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			got := bNode.getKey(tt.Index)
-			result := string(got)
-
-			if result != tt.Expected {
-				t.Errorf("Expected: %v; got: %v", tt.Expected, result)
-			}
-		})
-	}
+func TestBTreeBasicAscending(t *testing.T) {
+	commonTestBasic(t, func(h uint32) uint32 { return +h })
 }
 
-func TestGetVal(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("ab"), Value: []byte("cde")}, {Key: []byte("vw"), Value: []byte("yz")},
-	}
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-
-	tests := []struct {
-		Name     string
-		Index    uint16
-		Expected string
-	}{
-		{"Key index 0", 0, "cde"},
-		{"Key index 1", 1, "yz"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			got := bNode.getVal(tt.Index)
-			result := string(got)
-			if result != tt.Expected {
-				t.Errorf("Expected: %v; got: %v", tt.Expected, result)
-			}
-		})
-	}
+func TestBTreeBasicDescending(t *testing.T) {
+	commonTestBasic(t, func(h uint32) uint32 { return -h })
 }
 
-func TestNodeAppendKV(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("ab"), Value: []byte("cde")}, {Key: []byte("vw"), Value: []byte("yz")},
-	}
+func TestBTreeBasicRand(t *testing.T) {
+	commonTestBasic(t, utils.Fmix32)
+}
 
-	bNode := createTestBNode(BNODE_LEAF, kvs)
+func TestBTreeRandLength(t *testing.T) {
+	c := newC()
+	for i := 0; i < 2000; i++ {
+		klen := utils.Fmix32(uint32(2*i+0)) % BTREE_MAX_KEY_SIZE
+		vlen := utils.Fmix32(uint32(2*i+1)) % BTREE_MAX_VAL_SIZE
+		if klen == 0 {
+			continue
+		}
 
-	tests := []struct {
-		Name       string
-		Index      uint16
-		Ptr        uint64
-		Key        []byte
-		Val        []byte
-		NextOffset uint16
-	}{
-		{Name: "Index 0", Index: 0, Ptr: 2, Key: []byte("qw"), Val: []byte("tyu"), NextOffset: 9},
-		{Name: "Index 1", Index: 1, Ptr: 4, Key: []byte("12"), Val: []byte("34"), NextOffset: 17},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			nodeAppendKV(bNode, tt.Index, tt.Ptr, tt.Key, tt.Val)
-			if got := bNode.getPtr(tt.Index); got != tt.Ptr {
-				t.Errorf("Expected ptr: %v; got: %v", tt.Ptr, got)
-			}
-			if got := bNode.getKey(tt.Index); slices.Compare(got, tt.Key) != 0 {
-				t.Errorf("Expected key: %v; got: %v", tt.Key, got)
-			}
-			if got := bNode.getVal(tt.Index); slices.Compare(got, tt.Val) != 0 {
-				t.Errorf("Expected value: %v; got: %v", tt.Val, got)
-			}
-			if got := bNode.getOffset(tt.Index + 1); got != tt.NextOffset {
-				t.Errorf("Expected next offset: %v; got: %v", tt.NextOffset, got)
-			}
-		})
+		key := make([]byte, klen)
+		rand.Read(key)
+		val := make([]byte, vlen)
+		// rand.Read(val)
+		c.add(string(key), string(val))
+		c.verify(t)
 	}
 }
 
-func TestNBytes(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("ab"), Value: []byte("cde")}, {Key: []byte("vw"), Value: []byte("yz")},
-	}
-	bNode := createTestBNode(BNODE_LEAF, kvs)
+func TestBTreeIncLength(t *testing.T) {
+	for l := 1; l < BTREE_MAX_KEY_SIZE+BTREE_MAX_VAL_SIZE; l++ {
+		c := newC()
 
-	if got := bNode.nbytes(); got != 41 {
-		t.Errorf("Expected: %v; got: %v", 41, got)
-	}
-}
+		klen := l
+		if klen > BTREE_MAX_KEY_SIZE {
+			klen = BTREE_MAX_KEY_SIZE
+		}
+		vlen := l - klen
+		key := make([]byte, klen)
+		val := make([]byte, vlen)
 
-func TestNodeAppendRange(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("ab"), Value: []byte("cde")},
-		{Key: []byte("vw"), Value: []byte("yz")},
-		{Key: []byte("123"), Value: []byte("456")},
-		{Key: []byte("78"), Value: []byte("00009")},
-	}
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-	bNode.setPtr(0, 1)
-	bNode.setPtr(1, 6)
-	bNode.setPtr(2, 7)
-	bNode.setPtr(3, 32)
-
-	bNodeNew := BNode(make([]byte, len(bNode))) // zero node
-	bNodeNew.setHeader(bNode.btype(), bNode.nkeys())
-
-	nodeAppendRange(bNodeNew, bNode, 0, 1, 3) // copy from key "vw" to key "78" on new node on idx zero
-
-	tests := []struct {
-		Name  string
-		Index uint16
-		Ptr   uint64
-		Key   []byte
-		Val   []byte
-	}{
-		{Name: "Index 0", Index: 0, Ptr: 6, Key: []byte("vw"), Val: []byte("yz")},
-		{Name: "Index 1", Index: 1, Ptr: 7, Key: []byte("123"), Val: []byte("456")},
-		{Name: "Index 2", Index: 2, Ptr: 32, Key: []byte("78"), Val: []byte("00009")},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			if got := bNodeNew.getPtr(tt.Index); got != tt.Ptr {
-				t.Errorf("Expected ptr: %v; got: %v", tt.Ptr, got)
-			}
-			if got := bNodeNew.getKey(tt.Index); slices.Compare(got, tt.Key) != 0 {
-				t.Errorf("Expected key: %v; got: %v", tt.Key, got)
-			}
-			if got := bNodeNew.getVal(tt.Index); slices.Compare(got, tt.Val) != 0 {
-				t.Errorf("Expected value: %v; got: %v", tt.Val, got)
-			}
-		})
-	}
-
-}
-
-func TestLeafInsert(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("ab"), Value: []byte("cde")},
-		{Key: []byte("vw"), Value: []byte("yz")},
-		{Key: []byte("123"), Value: []byte("456")},
-	}
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-	bNode.setPtr(0, 1)
-	bNode.setPtr(1, 6)
-	bNode.setPtr(2, 7)
-
-	bNodeNew := BNode(make([]byte, len(bNode)+20)) // zero node with extra space
-
-	leafInsert(bNodeNew, bNode, 1, []byte("cd"), []byte("ef"))
-
-	tests := []struct {
-		Name  string
-		Index uint16
-		Ptr   uint64
-		Key   []byte
-		Val   []byte
-	}{
-		{Name: "Index 0", Index: 0, Ptr: 1, Key: []byte("ab"), Val: []byte("cde")},
-		{Name: "Index 1", Index: 1, Ptr: 0, Key: []byte("cd"), Val: []byte("ef")}, // new kv
-		{Name: "Index 2", Index: 2, Ptr: 6, Key: []byte("vw"), Val: []byte("yz")},
-		{Name: "Index 3", Index: 3, Ptr: 7, Key: []byte("123"), Val: []byte("456")},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			if got := bNodeNew.getPtr(tt.Index); got != tt.Ptr {
-				t.Errorf("Expected ptr: %v; got: %v", tt.Ptr, got)
-			}
-			if got := bNodeNew.getKey(tt.Index); slices.Compare(got, tt.Key) != 0 {
-				t.Errorf("Expected key: %v; got: %v", tt.Key, got)
-			}
-			if got := bNodeNew.getVal(tt.Index); slices.Compare(got, tt.Val) != 0 {
-				t.Errorf("Expected value: %v; got: %v", tt.Val, got)
-			}
-		})
-	}
-
-}
-
-func TestLeafUpdate(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte("ab"), Value: []byte("cde")},
-		{Key: []byte("vw"), Value: []byte("yz")},
-		{Key: []byte("123"), Value: []byte("456")},
-	}
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-	bNode.setPtr(0, 1)
-	bNode.setPtr(1, 6)
-	bNode.setPtr(2, 7)
-
-	bNodeNew := BNode(make([]byte, len(bNode)+20)) // zero node with extra space
-
-	leafUpdate(bNodeNew, bNode, 1, []byte("cd"), []byte("efx"))
-
-	tests := []struct {
-		Name  string
-		Index uint16
-		Ptr   uint64
-		Key   []byte
-		Val   []byte
-	}{
-		{Name: "Index 0", Index: 0, Ptr: 1, Key: []byte("ab"), Val: []byte("cde")},
-		{Name: "Index 1", Index: 1, Ptr: 0, Key: []byte("cd"), Val: []byte("efx")}, // updated kv
-		{Name: "Index 2", Index: 2, Ptr: 7, Key: []byte("123"), Val: []byte("456")},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			if got := bNodeNew.getPtr(tt.Index); got != tt.Ptr {
-				t.Errorf("Expected ptr: %v; got: %v", tt.Ptr, got)
-			}
-			if got := bNodeNew.getKey(tt.Index); slices.Compare(got, tt.Key) != 0 {
-				t.Errorf("Expected key: %v; got: %v", tt.Key, got)
-			}
-			if got := bNodeNew.getVal(tt.Index); slices.Compare(got, tt.Val) != 0 {
-				t.Errorf("Expected value: %v; got: %v", tt.Val, got)
-			}
-		})
-	}
-
-}
-
-func TestNodeLookupLE(t *testing.T) {
-	kvs := []KV{
-		{Key: []byte{7, 0}, Value: []byte("abc")},
-		{Key: []byte{13, 0}, Value: []byte("yz")},
-		{Key: []byte{25, 0}, Value: []byte("we")},
-	}
-
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-
-	tests := []struct {
-		Name     string
-		Key      []byte
-		Expected uint16
-	}{
-		{Name: "Key 6", Key: []byte{6, 0}, Expected: 65535},
-		{Name: "Key 7", Key: []byte{7, 0}, Expected: 0},
-		{Name: "Key 10", Key: []byte{10, 0}, Expected: 0},
-		{Name: "Key 13", Key: []byte{13, 0}, Expected: 1},
-		{Name: "Key 14", Key: []byte{14, 0}, Expected: 1},
-		{Name: "Key 25", Key: []byte{25, 0}, Expected: 2},
-		{Name: "Key 26", Key: []byte{26, 0}, Expected: 2},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.Name, func(t *testing.T) {
-			idx := nodeLookupLE(bNode, tt.Key)
-			if idx != tt.Expected {
-				t.Errorf("Expected ptr: %v; got: %v", tt.Expected, idx)
-			}
-		})
-	}
-}
-
-func TestNodeSplit2(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow test in short mode")
-	}
-
-	// create oversized node
-	kvs := []KV{
-		{[]byte("key1"), []byte(strings.Repeat("a", 1000))},
-		{[]byte("key2"), []byte(strings.Repeat("b", 1000))},
-		{[]byte("key3"), []byte(strings.Repeat("b", 1000))},
-		{[]byte("key4"), []byte(strings.Repeat("b", 1000))},
-	}
-
-	bNode := createTestBNode(BNODE_LEAF, kvs)
-	left := BNode(make([]byte, BTREE_PAGE_SIZE))
-	right := BNode(make([]byte, BTREE_PAGE_SIZE))
-
-	nodeSplit2(left, right, bNode)
-
-	if left.nkeys() != 2 {
-		t.Errorf("Left node should have 2 keys")
-	}
-
-	k1, k2 := string(left.getKey(0)), string(left.getKey(1))
-	if k1 != "key1" || k2 != "key2" {
-		t.Errorf("Unexpected keys: %v, %v for left node", k1, k2)
-	}
-
-	if right.nkeys() != 2 {
-		t.Errorf("Right node should have 2 keys")
-	}
-
-	k1, k2 = string(right.getKey(0)), string(right.getKey(1))
-	if k1 != "key3" || k2 != "key4" {
-		t.Errorf("Unexpected keys: %v, %v for left node", k1, k2)
+		factor := BTREE_PAGE_SIZE / l
+		size := factor * factor * 2
+		if size > 4000 {
+			size = 4000
+		}
+		if size < 10 {
+			size = 10
+		}
+		for i := 0; i < size; i++ {
+			rand.Read(key)
+			c.add(string(key), string(val))
+		}
+		c.verify(t)
 	}
 }

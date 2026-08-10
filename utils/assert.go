@@ -1,7 +1,9 @@
 package utils
 
-func Assert(value bool, stm string) {
-	if !value {
-		panic(stm)
+// Assert panics when cond is false. It is intended for internal invariants
+// which indicate a programming or storage-corruption bug when violated.
+func Assert(cond bool) {
+	if !cond {
+		panic("assertion failure")
 	}
 }
