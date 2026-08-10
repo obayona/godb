@@ -65,3 +65,33 @@ func TestBTreeIter(t *testing.T) {
 		}
 	}
 }
+
+func TestBTreeIteratorCrossesLeafLinks(t *testing.T) {
+	c := newC()
+	for i := 0; i < 2500; i++ {
+		c.add(fmt.Sprintf("key%010d", i), fmt.Sprintf("value-%d", i))
+	}
+
+	ptr := c.tree.Root
+	leaf := BNode(c.tree.GetPage(ptr))
+	for leaf.BType() == BNODE_NODE {
+		ptr = leaf.GetPtr(0)
+		leaf = BNode(c.tree.GetPage(ptr))
+	}
+	is.NotZero(t, leaf.NextLeaf())
+	next := BNode(c.tree.GetPage(leaf.NextLeaf()))
+
+	lastKey := append([]byte(nil), leaf.GetKey(leaf.NKeys()-1)...)
+	wantNext := append([]byte(nil), next.GetKey(0)...)
+	iter := c.tree.SeekLE(lastKey)
+	for i := 0; i+1 < len(iter.pos); i++ {
+		iter.pos[i] = ^uint16(0) // crossing must not consult the parent path
+	}
+	iter.Next()
+	got, _ := iter.Deref()
+	is.Equal(t, wantNext, got)
+
+	iter.Prev()
+	got, _ = iter.Deref()
+	is.Equal(t, lastKey, got)
+}

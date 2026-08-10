@@ -62,6 +62,7 @@ func (kv *KV) Begin(tx *KVTX) {
 	defer kv.mutex.Unlock()
 	// read-only snapshot, just the tree root and the page read callback
 	tx.snapshot.Root = kv.tree.Root
+	tx.snapshot.DisableLeafLinks = true
 	chunks := kv.mmap.chunks // copied to avoid updates from writers
 	tx.snapshot.GetPage = func(ptr uint64) []byte { return mmapRead(ptr, chunks) }
 	tx.version = kv.version
@@ -73,6 +74,8 @@ func (kv *KV) Begin(tx *KVTX) {
 		return uint64(len(pages))
 	}
 	tx.pending.DelPage = func(uint64) {}
+	tx.pending.SetPage = func(ptr uint64) []byte { return pages[ptr-1] }
+	tx.pending.DisableLeafLinks = true
 	// keep track of concurrent TXs
 	kv.ongoing = append(kv.ongoing, tx.version)
 	// XXX: sanity check; unreliable

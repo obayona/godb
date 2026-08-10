@@ -3,6 +3,7 @@ package btree
 import (
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"testing"
 	"unsafe"
@@ -36,6 +37,11 @@ func newC() *C {
 			DelPage: func(ptr uint64) {
 				utils.Assert(pages[ptr] != nil)
 				delete(pages, ptr)
+			},
+			SetPage: func(ptr uint64) []byte {
+				node, ok := pages[ptr]
+				utils.Assert(ok)
+				return node
 			},
 		},
 		ref:   map[string]string{},
@@ -105,22 +111,75 @@ func (c *C) verify(t *testing.T) {
 	is.Equal(t, rkeys, keys)
 	is.Equal(t, rvals, vals)
 
-	var nodeVerify func(BNode)
-	nodeVerify = func(node BNode) {
+	leaves := []uint64{}
+	var nodeVerify func(uint64)
+	nodeVerify = func(ptr uint64) {
+		node := BNode(c.tree.GetPage(ptr))
 		nkeys := node.NKeys()
 		utils.Assert(nkeys >= 1)
 		if node.BType() == BNODE_LEAF {
+			leaves = append(leaves, ptr)
 			return
 		}
 		for i := uint16(0); i < nkeys; i++ {
 			key := node.GetKey(i)
-			kid := BNode(c.tree.GetPage(node.GetPtr(i)))
+			kidPtr := node.GetPtr(i)
+			kid := BNode(c.tree.GetPage(kidPtr))
 			is.Equal(t, key, kid.GetKey(0))
-			nodeVerify(kid)
+			nodeVerify(kidPtr)
 		}
 	}
 
-	nodeVerify(c.tree.GetPage(c.tree.Root))
+	nodeVerify(c.tree.Root)
+	for i, ptr := range leaves {
+		leaf := BNode(c.tree.GetPage(ptr))
+		var wantPrev, wantNext uint64
+		if i > 0 {
+			wantPrev = leaves[i-1]
+		}
+		if i+1 < len(leaves) {
+			wantNext = leaves[i+1]
+		}
+		is.Equal(t, wantPrev, leaf.PrevLeaf(), "previous link for leaf %d", i)
+		is.Equal(t, wantNext, leaf.NextLeaf(), "next link for leaf %d", i)
+	}
+
+	linkedKeys := []string{}
+	for ptr := leaves[0]; ptr != 0; {
+		leaf := BNode(c.tree.GetPage(ptr))
+		for i := uint16(0); i < leaf.NKeys(); i++ {
+			linkedKeys = append(linkedKeys, string(leaf.GetKey(i)))
+		}
+		ptr = leaf.NextLeaf()
+	}
+	is.Equal(t, append([]string{""}, rkeys...), linkedKeys)
+
+	reverseKeys := []string{}
+	for ptr := leaves[len(leaves)-1]; ptr != 0; {
+		leaf := BNode(c.tree.GetPage(ptr))
+		for i := int(leaf.NKeys()) - 1; i >= 0; i-- {
+			reverseKeys = append(reverseKeys, string(leaf.GetKey(uint16(i))))
+		}
+		ptr = leaf.PrevLeaf()
+	}
+	slices.Reverse(linkedKeys)
+	is.Equal(t, linkedKeys, reverseKeys)
+}
+
+func TestBTreeLeafLinksAfterSplitAndMerge(t *testing.T) {
+	c := newC()
+	for i := 0; i < 5000; i++ {
+		c.add(fmt.Sprintf("key%08d", i), fmt.Sprintf("value-%d", i))
+	}
+	c.verify(t)
+
+	for i := 0; i < 4900; i++ {
+		is.True(t, c.del(fmt.Sprintf("key%08d", i)))
+		if i%250 == 0 {
+			c.verify(t)
+		}
+	}
+	c.verify(t)
 }
 
 func commonTestBasic(t *testing.T, hasher func(uint32) uint32) {

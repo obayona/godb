@@ -8,7 +8,8 @@ utils -> btree -----> kvstore -> table -> ql -> cmd/demo
           \-> freelist --/
 ```
 
-- `btree/` implements page-oriented B+tree nodes and iterators.
+- `btree/` implements page-oriented B+tree nodes, bidirectionally linked leaf
+  pages, and iterators.
 - `freelist/` implements the reusable, version-aware queue of free pages.
 - `kvstore/` implements files, snapshots, and KV transactions by composing the
   B-tree and free list.
@@ -28,3 +29,7 @@ go run ./cmd/demo
 
 The demo creates a table, inserts rows, deletes one row, and selects the
 remaining data.
+
+The linked-leaf format uses the database signature `GoDBLinkedLeaf01` and is
+not binary-compatible with database files produced by the earlier node
+format.

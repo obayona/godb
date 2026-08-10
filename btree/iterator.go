@@ -8,9 +8,10 @@ import (
 
 // B-tree iterator
 type BIter struct {
-	tree *BTree
-	path []BNode  // from root to leaf
-	pos  []uint16 // indexes into nodes
+	tree    *BTree
+	path    []BNode  // from root to leaf
+	pos     []uint16 // indexes into nodes
+	leafPtr uint64
 }
 
 // current KV pair
@@ -23,12 +24,10 @@ func (iter *BIter) Deref() ([]byte, []byte) {
 }
 
 func iterIsFirst(iter *BIter) bool {
-	for _, pos := range iter.pos {
-		if pos != 0 {
-			return false
-		}
-	}
-	return true // the first key is an dummy sentry
+	last := len(iter.path) - 1
+	return last < 0 || iter.pos[last] == 0 &&
+		iter.path[last].BType() == BNODE_LEAF &&
+		iter.path[last].PrevLeaf() == 0
 }
 
 func iterIsEnd(iter *BIter) bool {
@@ -77,12 +76,43 @@ func iterNext(iter *BIter, level int) {
 
 func (iter *BIter) Prev() {
 	if !iterIsFirst(iter) {
+		if !iter.tree.DisableLeafLinks {
+			last := len(iter.path) - 1
+			if iter.pos[last] > 0 {
+				iter.pos[last]--
+				return
+			}
+			ptr := iter.path[last].PrevLeaf()
+			utils.Assert(ptr != 0)
+			leaf := BNode(iter.tree.GetPage(ptr))
+			iter.path[last] = leaf
+			iter.pos[last] = leaf.NKeys() - 1
+			iter.leafPtr = ptr
+			return
+		}
 		iterPrev(iter, len(iter.path)-1)
 	}
 }
 
 func (iter *BIter) Next() {
 	if !iterIsEnd(iter) {
+		if !iter.tree.DisableLeafLinks {
+			last := len(iter.path) - 1
+			if iter.pos[last]+1 < iter.path[last].NKeys() {
+				iter.pos[last]++
+				return
+			}
+			ptr := iter.path[last].NextLeaf()
+			if ptr == 0 {
+				iter.pos[last] = iter.path[last].NKeys()
+				return
+			}
+			leaf := BNode(iter.tree.GetPage(ptr))
+			iter.path[last] = leaf
+			iter.pos[last] = 0
+			iter.leafPtr = ptr
+			return
+		}
 		iterNext(iter, len(iter.path)-1)
 	}
 }
@@ -95,6 +125,10 @@ func (tree *BTree) SeekLE(key []byte) *BIter {
 		idx := nodeLookupLE(node, key)
 		iter.path = append(iter.path, node)
 		iter.pos = append(iter.pos, idx)
+		if node.BType() == BNODE_LEAF {
+			iter.leafPtr = ptr
+			break
+		}
 		ptr = node.GetPtr(idx)
 	}
 	return iter

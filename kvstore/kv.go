@@ -140,6 +140,8 @@ func (db *KV) Open() error {
 	db.tree.GetPage = db.pageRead
 	db.tree.NewPage = db.pageAlloc
 	db.tree.DelPage = db.free.PushTail
+	db.tree.SetPage = db.pageWrite
+	db.tree.DisableLeafLinks = true
 	// free list callbacks
 	db.free.Configure(freelist.PageIO{
 		Get: db.pageRead,
@@ -170,7 +172,9 @@ fail:
 	return fmt.Errorf("KV.Open: %w", err)
 }
 
-const DB_SIG = "BuildYourOwnDB13"
+// DB_SIG changes when an incompatible on-disk page format is introduced.
+// Version 01 uses distinct internal/leaf layouts and linked leaf pages.
+const DB_SIG = "GoDBLinkedLeaf01"
 
 /*
 the 1st page stores the root pointer and other auxiliary data.

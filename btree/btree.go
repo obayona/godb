@@ -8,22 +8,38 @@ import (
 	"github.com/obayona/godb/utils"
 )
 
-// node format:
-// | type | nkeys |  pointers  |   offsets  | key-values
-// |  2B  |   2B  | nkeys * 8B | nkeys * 2B | ...
-
-// key-value format:
-// | klen | vlen | key | val |
-// |  2B  |  2B  | ... | ... |
-
-const HEADER = 4
+// Pages use separate internal and leaf layouts.
+//
+// Internal page:
+//
+//	| type | nkeys | child pointers | value offsets | separator keys |
+//	|  2B  |   2B  |   nkeys * 8B   |  nkeys * 2B  |      ...       |
+//
+// Leaf page:
+//
+//	| type | nkeys | previous leaf | next leaf | value offsets | key-values |
+//	|  2B  |   2B  |      8B       |    8B     |  nkeys * 2B  |    ...     |
+//
+// Each separator or key-value entry is encoded as:
+//
+//	| key length | value length | key | value |
+//	|     2B     |      2B      | ... |  ...  |
+//
+// Internal values are empty. Leaf links contain physical page pointers and
+// form a bidirectional list. The first leaf starts with the dummy empty key
+// used to cover the key space; its previous pointer is zero. The final leaf's
+// next pointer is zero.
+const (
+	INTERNAL_HEADER = 4
+	LEAF_HEADER     = 20
+)
 
 const BTREE_PAGE_SIZE = 4096
 const BTREE_MAX_KEY_SIZE = 1000
 const BTREE_MAX_VAL_SIZE = 3000
 
 func init() {
-	node1max := HEADER + 8 + 2 + 4 + BTREE_MAX_KEY_SIZE + BTREE_MAX_VAL_SIZE
+	node1max := LEAF_HEADER + 2 + 4 + BTREE_MAX_KEY_SIZE + BTREE_MAX_VAL_SIZE
 	utils.Assert(node1max <= BTREE_PAGE_SIZE)
 }
 
@@ -41,6 +57,13 @@ type BTree struct {
 	GetPage func(uint64) []byte // dereference a pointer
 	NewPage func([]byte) uint64 // allocate a new page
 	DelPage func(uint64)        // deallocate a page
+	// SetPage returns writable bytes for an existing page. The tree uses it
+	// only to maintain leaf links; key/value contents remain copy-on-write.
+	SetPage func(uint64) []byte
+	// DisableLeafLinks keeps iterators on root-to-leaf paths. It is intended for
+	// historical snapshots whose link metadata may have advanced in a newer
+	// copy-on-write tree version. Normal trees traverse sibling links.
+	DisableLeafLinks bool
 }
 
 // header
@@ -55,24 +78,64 @@ func (node BNode) SetHeader(btype uint16, nkeys uint16) {
 	binary.LittleEndian.PutUint16(node[2:4], nkeys)
 }
 
+func (node BNode) headerSize() uint16 {
+	if node.BType() == BNODE_LEAF {
+		return LEAF_HEADER
+	}
+	return INTERNAL_HEADER
+}
+
+func (node BNode) pointerBytes() uint16 {
+	if node.BType() == BNODE_NODE {
+		return 8 * node.NKeys()
+	}
+	return 0
+}
+
+// PrevLeaf returns the previous leaf page pointer.
+func (node BNode) PrevLeaf() uint64 {
+	utils.Assert(node.BType() == BNODE_LEAF)
+	return binary.LittleEndian.Uint64(node[4:12])
+}
+
+// NextLeaf returns the next leaf page pointer.
+func (node BNode) NextLeaf() uint64 {
+	utils.Assert(node.BType() == BNODE_LEAF)
+	return binary.LittleEndian.Uint64(node[12:20])
+}
+
+// SetPrevLeaf sets the previous leaf page pointer.
+func (node BNode) SetPrevLeaf(ptr uint64) {
+	utils.Assert(node.BType() == BNODE_LEAF)
+	binary.LittleEndian.PutUint64(node[4:12], ptr)
+}
+
+// SetNextLeaf sets the next leaf page pointer.
+func (node BNode) SetNextLeaf(ptr uint64) {
+	utils.Assert(node.BType() == BNODE_LEAF)
+	binary.LittleEndian.PutUint64(node[12:20], ptr)
+}
+
 // pointers
 func (node BNode) GetPtr(idx uint16) uint64 {
+	utils.Assert(node.BType() == BNODE_NODE)
 	utils.Assert(idx < node.NKeys())
-	pos := HEADER + 8*idx
+	pos := INTERNAL_HEADER + 8*idx
 	return binary.LittleEndian.Uint64(node[pos:])
 }
 func (node BNode) SetPtr(idx uint16, val uint64) {
+	utils.Assert(node.BType() == BNODE_NODE)
 	utils.Assert(idx < node.NKeys())
 	// utils.Assert(node.BType() == BNODE_LEAF || val != 0)
 	// utils.Assert(node.BType() == BNODE_NODE || val == 0)
-	pos := HEADER + 8*idx
+	pos := INTERNAL_HEADER + 8*idx
 	binary.LittleEndian.PutUint64(node[pos:], val)
 }
 
 // offset list
 func offsetPos(node BNode, idx uint16) uint16 {
 	utils.Assert(1 <= idx && idx <= node.NKeys())
-	return HEADER + 8*node.NKeys() + 2*(idx-1)
+	return node.headerSize() + node.pointerBytes() + 2*(idx-1)
 }
 func (node BNode) GetOffset(idx uint16) uint16 {
 	if idx == 0 {
@@ -87,7 +150,7 @@ func (node BNode) SetOffset(idx uint16, offset uint16) {
 // key-values
 func (node BNode) KVPos(idx uint16) uint16 {
 	utils.Assert(idx <= node.NKeys())
-	return HEADER + 8*node.NKeys() + 2*node.NKeys() + node.GetOffset(idx)
+	return node.headerSize() + node.pointerBytes() + 2*node.NKeys() + node.GetOffset(idx)
 }
 func (node BNode) GetKey(idx uint16) []byte {
 	utils.Assert(idx < node.NKeys())
@@ -133,6 +196,8 @@ func leafInsert(
 	key []byte, val []byte,
 ) {
 	new.SetHeader(BNODE_LEAF, old.NKeys()+1)
+	new.SetPrevLeaf(old.PrevLeaf())
+	new.SetNextLeaf(old.NextLeaf())
 	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendKV(new, idx, 0, key, val)
 	nodeAppendRange(new, old, idx+1, idx, old.NKeys()-idx)
@@ -144,6 +209,8 @@ func leafUpdate(
 	key []byte, val []byte,
 ) {
 	new.SetHeader(BNODE_LEAF, old.NKeys())
+	new.SetPrevLeaf(old.PrevLeaf())
+	new.SetNextLeaf(old.NextLeaf())
 	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendKV(new, idx, 0, key, val)
 	nodeAppendRange(new, old, idx+1, idx+1, old.NKeys()-(idx+1))
@@ -160,19 +227,84 @@ func nodeReplaceKidN(
 	tree *BTree, new BNode, old BNode, idx uint16,
 	kids ...BNode,
 ) {
+	ptrs := make([]uint64, len(kids))
+	for i, kid := range kids {
+		ptrs[i] = tree.NewPage(kid)
+	}
+	nodeReplaceKidNPtrs(new, old, idx, kids, ptrs)
+}
+
+func nodeReplaceKidNPtrs(
+	new BNode, old BNode, idx uint16,
+	kids []BNode, ptrs []uint64,
+) {
+	utils.Assert(len(kids) == len(ptrs))
 	inc := uint16(len(kids))
 	if inc == 1 && bytes.Equal(kids[0].GetKey(0), old.GetKey(idx)) {
 		// common case, only replace 1 pointer
-		nodeReplaceKid1ptr(new, old, idx, tree.NewPage(kids[0]))
+		nodeReplaceKid1ptr(new, old, idx, ptrs[0])
 		return
 	}
 
 	new.SetHeader(BNODE_NODE, old.NKeys()+inc-1)
 	nodeAppendRange(new, old, 0, 0, idx)
 	for i, node := range kids {
-		nodeAppendKV(new, idx+uint16(i), tree.NewPage(node), node.GetKey(0), nil)
+		nodeAppendKV(new, idx+uint16(i), ptrs[i], node.GetKey(0), nil)
 	}
 	nodeAppendRange(new, old, idx+inc, idx+1, old.NKeys()-(idx+1))
+}
+
+// allocateLeafReplacement allocates one or more leaves that replace oldPtr,
+// links them together, and redirects the two outside neighbors. Existing leaf
+// contents remain copy-on-write; only sibling-link fields are updated in place.
+func allocateLeafReplacement(
+	tree *BTree, oldPtr uint64, old BNode, leaves []BNode,
+) []uint64 {
+	utils.Assert(old.BType() == BNODE_LEAF)
+	utils.Assert(len(leaves) > 0)
+	ptrs := make([]uint64, len(leaves))
+	for i, leaf := range leaves {
+		utils.Assert(leaf.BType() == BNODE_LEAF)
+		ptrs[i] = tree.NewPage(leaf)
+	}
+	for i, ptr := range ptrs {
+		leaf := BNode(tree.SetPage(ptr))
+		if i == 0 {
+			leaf.SetPrevLeaf(old.PrevLeaf())
+		} else {
+			leaf.SetPrevLeaf(ptrs[i-1])
+		}
+		if i+1 == len(ptrs) {
+			leaf.SetNextLeaf(old.NextLeaf())
+		} else {
+			leaf.SetNextLeaf(ptrs[i+1])
+		}
+	}
+	if prev := old.PrevLeaf(); prev != 0 {
+		BNode(tree.SetPage(prev)).SetNextLeaf(ptrs[0])
+	}
+	if next := old.NextLeaf(); next != 0 {
+		BNode(tree.SetPage(next)).SetPrevLeaf(ptrs[len(ptrs)-1])
+	}
+	return ptrs
+}
+
+func allocateLeafMerge(
+	tree *BTree, leftPtr uint64, left BNode, rightPtr uint64, right BNode, merged BNode,
+) uint64 {
+	utils.Assert(left.NextLeaf() == rightPtr)
+	utils.Assert(right.PrevLeaf() == leftPtr)
+	ptr := tree.NewPage(merged)
+	leaf := BNode(tree.SetPage(ptr))
+	leaf.SetPrevLeaf(left.PrevLeaf())
+	leaf.SetNextLeaf(right.NextLeaf())
+	if prev := left.PrevLeaf(); prev != 0 {
+		BNode(tree.SetPage(prev)).SetNextLeaf(ptr)
+	}
+	if next := right.NextLeaf(); next != 0 {
+		BNode(tree.SetPage(next)).SetPrevLeaf(ptr)
+	}
+	return ptr
 }
 
 // replace 2 adjacent links with 1
@@ -189,7 +321,11 @@ func nodeReplace2Kid(
 // copy a KV into the position
 func nodeAppendKV(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
 	// ptrs
-	new.SetPtr(idx, ptr)
+	if new.BType() == BNODE_NODE {
+		new.SetPtr(idx, ptr)
+	} else {
+		utils.Assert(ptr == 0)
+	}
 	// KVs
 	pos := new.KVPos(idx)
 	binary.LittleEndian.PutUint16(new[pos+0:], uint16(len(key)))
@@ -212,8 +348,11 @@ func nodeAppendRange(
 	}
 
 	// pointers
-	for i := uint16(0); i < n; i++ {
-		new.SetPtr(dstNew+i, old.GetPtr(srcOld+i))
+	if new.BType() == BNODE_NODE {
+		utils.Assert(old.BType() == BNODE_NODE)
+		for i := uint16(0); i < n; i++ {
+			new.SetPtr(dstNew+i, old.GetPtr(srcOld+i))
+		}
 	}
 	// offsets
 	dstBegin := new.GetOffset(dstNew)
@@ -237,19 +376,29 @@ func nodeSplit2(left BNode, right BNode, old BNode) {
 	nleft := old.NKeys() / 2
 
 	// try to fit the left half
-	left_bytes := func() uint16 {
-		return HEADER + 8*nleft + 2*nleft + old.GetOffset(nleft)
+	nbytes := func(start, count uint16) uint16 {
+		header := uint16(INTERNAL_HEADER)
+		pointers := uint16(8 * count)
+		if old.BType() == BNODE_LEAF {
+			header = LEAF_HEADER
+			pointers = 0
+		}
+		payload := old.GetOffset(start+count) - old.GetOffset(start)
+		return header + pointers + 2*count + payload
 	}
-	for left_bytes() > BTREE_PAGE_SIZE {
+	leftBytes := func() uint16 {
+		return nbytes(0, nleft)
+	}
+	for leftBytes() > BTREE_PAGE_SIZE {
 		nleft--
 	}
 	utils.Assert(nleft >= 1)
 
 	// try to fit the right half
-	right_bytes := func() uint16 {
-		return old.NBytes() - left_bytes() + HEADER
+	rightBytes := func() uint16 {
+		return nbytes(nleft, old.NKeys()-nleft)
 	}
-	for right_bytes() > BTREE_PAGE_SIZE {
+	for rightBytes() > BTREE_PAGE_SIZE {
 		nleft++
 	}
 	utils.Assert(nleft < old.NKeys())
@@ -257,6 +406,10 @@ func nodeSplit2(left BNode, right BNode, old BNode) {
 
 	left.SetHeader(old.BType(), nleft)
 	right.SetHeader(old.BType(), nright)
+	if old.BType() == BNODE_LEAF {
+		left.SetPrevLeaf(old.PrevLeaf())
+		right.SetNextLeaf(old.NextLeaf())
+	}
 	nodeAppendRange(left, old, 0, 0, nleft)
 	nodeAppendRange(right, old, 0, nleft, nright)
 	// the left half may be still too big
@@ -347,30 +500,43 @@ func treeInsert(req *UpdateReq, node BNode) BNode {
 // part of the treeInsert(): KV insertion to an internal node
 func nodeInsert(req *UpdateReq, new BNode, node BNode, idx uint16) BNode {
 	kptr := node.GetPtr(idx)
+	kid := BNode(req.tree.GetPage(kptr))
 	// recursive insertion to the kid node
-	updated := treeInsert(req, req.tree.GetPage(kptr))
+	updated := treeInsert(req, kid)
 	if len(updated) == 0 {
 		return BNode{}
 	}
 	// split the result
 	nsplit, split := nodeSplit3(updated)
-	// deallocate the kid node
-	req.tree.DelPage(kptr)
-	// update the kid links
-	nodeReplaceKidN(req.tree, new, node, idx, split[:nsplit]...)
+	if kid.BType() == BNODE_LEAF {
+		ptrs := allocateLeafReplacement(req.tree, kptr, kid, split[:nsplit])
+		req.tree.DelPage(kptr)
+		nodeReplaceKidNPtrs(new, node, idx, split[:nsplit], ptrs)
+	} else {
+		// deallocate and replace an internal child.
+		req.tree.DelPage(kptr)
+		nodeReplaceKidN(req.tree, new, node, idx, split[:nsplit]...)
+	}
 	return new
 }
 
 // remove a key from a leaf node
 func leafDelete(new BNode, old BNode, idx uint16) {
 	new.SetHeader(BNODE_LEAF, old.NKeys()-1)
+	new.SetPrevLeaf(old.PrevLeaf())
+	new.SetNextLeaf(old.NextLeaf())
 	nodeAppendRange(new, old, 0, 0, idx)
 	nodeAppendRange(new, old, idx, idx+1, old.NKeys()-(idx+1))
 }
 
 // merge 2 nodes into 1
 func nodeMerge(new BNode, left BNode, right BNode) {
+	utils.Assert(left.BType() == right.BType())
 	new.SetHeader(left.BType(), left.NKeys()+right.NKeys())
+	if left.BType() == BNODE_LEAF {
+		new.SetPrevLeaf(left.PrevLeaf())
+		new.SetNextLeaf(right.NextLeaf())
+	}
 	nodeAppendRange(new, left, 0, 0, left.NKeys())
 	nodeAppendRange(new, right, left.NKeys(), 0, right.NKeys())
 	utils.Assert(new.NBytes() <= BTREE_PAGE_SIZE)
@@ -411,31 +577,54 @@ func nodeDelete(req *DeleteReq, node BNode, idx uint16) BNode {
 	tree := req.tree
 	// recurse into the kid
 	kptr := node.GetPtr(idx)
-	updated := treeDelete(req, tree.GetPage(kptr))
+	kid := BNode(tree.GetPage(kptr))
+	updated := treeDelete(req, kid)
 	if len(updated) == 0 {
 		return BNode{} // not found
 	}
-	tree.DelPage(kptr)
-
 	new := BNode(make([]byte, BTREE_PAGE_SIZE))
 	// check for merging
 	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
 	switch {
 	case mergeDir < 0: // left
+		siblingPtr := node.GetPtr(idx - 1)
 		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
 		nodeMerge(merged, sibling, updated)
-		tree.DelPage(node.GetPtr(idx - 1))
-		nodeReplace2Kid(new, node, idx-1, tree.NewPage(merged), merged.GetKey(0))
+		var ptr uint64
+		if kid.BType() == BNODE_LEAF {
+			ptr = allocateLeafMerge(tree, siblingPtr, sibling, kptr, kid, merged)
+		} else {
+			ptr = tree.NewPage(merged)
+		}
+		tree.DelPage(siblingPtr)
+		tree.DelPage(kptr)
+		nodeReplace2Kid(new, node, idx-1, ptr, merged.GetKey(0))
 	case mergeDir > 0: // right
+		siblingPtr := node.GetPtr(idx + 1)
 		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
 		nodeMerge(merged, updated, sibling)
-		tree.DelPage(node.GetPtr(idx + 1))
-		nodeReplace2Kid(new, node, idx, tree.NewPage(merged), merged.GetKey(0))
+		var ptr uint64
+		if kid.BType() == BNODE_LEAF {
+			ptr = allocateLeafMerge(tree, kptr, kid, siblingPtr, sibling, merged)
+		} else {
+			ptr = tree.NewPage(merged)
+		}
+		tree.DelPage(kptr)
+		tree.DelPage(siblingPtr)
+		nodeReplace2Kid(new, node, idx, ptr, merged.GetKey(0))
 	case mergeDir == 0 && updated.NKeys() == 0:
+		tree.DelPage(kptr)
 		utils.Assert(node.NKeys() == 1 && idx == 0) // 1 empty child but no sibling
 		new.SetHeader(BNODE_NODE, 0)                // the parent becomes empty too
 	case mergeDir == 0 && updated.NKeys() > 0: // no merge
-		nodeReplaceKidN(tree, new, node, idx, updated)
+		if kid.BType() == BNODE_LEAF {
+			ptrs := allocateLeafReplacement(tree, kptr, kid, []BNode{updated})
+			tree.DelPage(kptr)
+			nodeReplaceKidNPtrs(new, node, idx, []BNode{updated}, ptrs)
+		} else {
+			tree.DelPage(kptr)
+			nodeReplaceKidN(tree, new, node, idx, updated)
+		}
 	}
 	return new
 }
@@ -451,19 +640,30 @@ func shouldMerge(
 
 	if idx > 0 {
 		sibling := BNode(tree.GetPage(node.GetPtr(idx - 1)))
-		merged := sibling.NBytes() + updated.NBytes() - HEADER
+		merged := mergedNodeSize(sibling, updated)
 		if merged <= BTREE_PAGE_SIZE {
 			return -1, sibling // left
 		}
 	}
 	if idx+1 < node.NKeys() {
 		sibling := BNode(tree.GetPage(node.GetPtr(idx + 1)))
-		merged := sibling.NBytes() + updated.NBytes() - HEADER
+		merged := mergedNodeSize(updated, sibling)
 		if merged <= BTREE_PAGE_SIZE {
 			return +1, sibling // right
 		}
 	}
 	return 0, BNode{}
+}
+
+func mergedNodeSize(left, right BNode) uint16 {
+	header := uint16(INTERNAL_HEADER)
+	pointers := uint16(8 * (left.NKeys() + right.NKeys()))
+	if left.BType() == BNODE_LEAF {
+		header = LEAF_HEADER
+		pointers = 0
+	}
+	return header + pointers + 2*(left.NKeys()+right.NKeys()) +
+		left.GetOffset(left.NKeys()) + right.GetOffset(right.NKeys())
 }
 
 func checkLimit(key []byte, val []byte) error {
@@ -504,14 +704,31 @@ func (tree *BTree) Update(req *UpdateReq) (bool, error) {
 	}
 
 	req.tree = tree
-	updated := treeInsert(req, tree.GetPage(tree.Root))
+	oldRootPtr := tree.Root
+	oldRoot := BNode(tree.GetPage(oldRootPtr))
+	updated := treeInsert(req, oldRoot)
 	if len(updated) == 0 {
 		return false, nil // not updated
 	}
 
 	// replace the root node
 	nsplit, split := nodeSplit3(updated)
-	tree.DelPage(tree.Root)
+	if oldRoot.BType() == BNODE_LEAF {
+		ptrs := allocateLeafReplacement(tree, oldRootPtr, oldRoot, split[:nsplit])
+		tree.DelPage(oldRootPtr)
+		if nsplit == 1 {
+			tree.Root = ptrs[0]
+			return true, nil
+		}
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.SetHeader(BNODE_NODE, nsplit)
+		for i, knode := range split[:nsplit] {
+			nodeAppendKV(root, uint16(i), ptrs[i], knode.GetKey(0), nil)
+		}
+		tree.Root = tree.NewPage(root)
+		return true, nil
+	}
+	tree.DelPage(oldRootPtr)
 	if nsplit > 1 {
 		// the root was split, add a new level.
 		root := BNode(make([]byte, BTREE_PAGE_SIZE))
@@ -537,12 +754,21 @@ func (tree *BTree) Delete(req *DeleteReq) (bool, error) {
 	}
 
 	req.tree = tree
-	updated := treeDelete(req, tree.GetPage(tree.Root))
+	oldRootPtr := tree.Root
+	oldRoot := BNode(tree.GetPage(oldRootPtr))
+	updated := treeDelete(req, oldRoot)
 	if len(updated) == 0 {
 		return false, nil // not found
 	}
 
-	tree.DelPage(tree.Root)
+	if oldRoot.BType() == BNODE_LEAF {
+		ptrs := allocateLeafReplacement(tree, oldRootPtr, oldRoot, []BNode{updated})
+		tree.DelPage(oldRootPtr)
+		tree.Root = ptrs[0]
+		return true, nil
+	}
+
+	tree.DelPage(oldRootPtr)
 	if updated.BType() == BNODE_NODE && updated.NKeys() == 1 {
 		// remove a level
 		tree.Root = updated.GetPtr(0)
