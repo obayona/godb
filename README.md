@@ -35,6 +35,10 @@ an index for simple equality and range predicates when a leading index prefix
 matches; computed, ambiguous, and otherwise unsupported predicates fall back
 to a full primary-index scan.
 
+`QLResult.Rows()` provides decoded query rows with `int64` and `string` values.
+The lower-level `QLResult.Records` iterator remains available when byte-string
+columns must be preserved as raw `[]byte` data.
+
 The linked-leaf format uses the database signature `GoDBLinkedLeaf01` and is
 not binary-compatible with database files produced by the earlier node
 format.

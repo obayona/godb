@@ -52,13 +52,14 @@ func main() {
 
 		fmt.Printf("> %s\n", statement)
 		fmt.Printf("  added=%d updated=%d deleted=%d\n", result.Added, result.Updated, result.Deleted)
-		for result.Records != nil && result.Records.Valid() {
-			var record table.Record
-			if err := result.Records.Deref(&record); err != nil {
+		rows := result.Rows()
+		for rows.Valid() {
+			row, err := rows.Deref()
+			if err != nil {
 				log.Fatal(err)
 			}
-			fmt.Printf("  %+v\n", record)
-			result.Records.Next()
+			fmt.Printf("  %s\n", row)
+			rows.Next()
 		}
 	}
 }
