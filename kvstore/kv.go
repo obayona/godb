@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/obayona/godb/btree"
+	"github.com/obayona/godb/freelist"
 	"github.com/obayona/godb/utils"
 	"golang.org/x/sys/unix"
 )
@@ -21,7 +22,7 @@ type KV struct {
 	// internals
 	fd   int
 	tree btree.BTree
-	free FreeList
+	free freelist.FreeList
 	mmap struct {
 		total  int      // mmap size, can be larger than the file size
 		chunks [][]byte // multiple mmaps, can be non-continuous
@@ -77,7 +78,7 @@ func (db *KV) pageAlloc(node []byte) uint64 {
 	return db.pageAppend(node) // append
 }
 
-// `FreeList.new`, append a new page.
+// pageAppend implements freelist.PageIO.New by appending a page.
 func (db *KV) pageAppend(node []byte) uint64 {
 	utils.Assert(len(node) == btree.BTREE_PAGE_SIZE)
 	ptr := db.page.flushed + db.page.nappend
@@ -87,7 +88,7 @@ func (db *KV) pageAppend(node []byte) uint64 {
 	return ptr
 }
 
-// `FreeList.set`, update an existing page.
+// pageWrite implements freelist.PageIO.Set for an existing page.
 func (db *KV) pageWrite(ptr uint64) []byte {
 	utils.Assert(ptr < db.page.flushed+db.page.nappend)
 	if node, ok := db.page.updates[ptr]; ok {
@@ -140,9 +141,11 @@ func (db *KV) Open() error {
 	db.tree.NewPage = db.pageAlloc
 	db.tree.DelPage = db.free.PushTail
 	// free list callbacks
-	db.free.get = db.pageRead
-	db.free.new = db.pageAppend
-	db.free.set = db.pageWrite
+	db.free.Configure(freelist.PageIO{
+		Get: db.pageRead,
+		New: db.pageAppend,
+		Set: db.pageWrite,
+	})
 	// open or create the DB file
 	if db.fd, err = createFileSync(db.Path); err != nil {
 		return err
@@ -177,10 +180,12 @@ the 1st page stores the root pointer and other auxiliary data.
 func loadMeta(db *KV, data []byte) {
 	db.tree.Root = binary.LittleEndian.Uint64(data[16:24])
 	db.page.flushed = binary.LittleEndian.Uint64(data[24:32])
-	db.free.headPage = binary.LittleEndian.Uint64(data[32:40])
-	db.free.headSeq = binary.LittleEndian.Uint64(data[40:48])
-	db.free.tailPage = binary.LittleEndian.Uint64(data[48:56])
-	db.free.tailSeq = binary.LittleEndian.Uint64(data[56:64])
+	db.free.Restore(freelist.State{
+		HeadPage: binary.LittleEndian.Uint64(data[32:40]),
+		HeadSeq:  binary.LittleEndian.Uint64(data[40:48]),
+		TailPage: binary.LittleEndian.Uint64(data[48:56]),
+		TailSeq:  binary.LittleEndian.Uint64(data[56:64]),
+	})
 	db.version = binary.LittleEndian.Uint64(data[64:72])
 }
 
@@ -189,10 +194,11 @@ func saveMeta(db *KV) []byte {
 	copy(data[:16], []byte(DB_SIG))
 	binary.LittleEndian.PutUint64(data[16:24], db.tree.Root)
 	binary.LittleEndian.PutUint64(data[24:32], db.page.flushed)
-	binary.LittleEndian.PutUint64(data[32:40], db.free.headPage)
-	binary.LittleEndian.PutUint64(data[40:48], db.free.headSeq)
-	binary.LittleEndian.PutUint64(data[48:56], db.free.tailPage)
-	binary.LittleEndian.PutUint64(data[56:64], db.free.tailSeq)
+	state := db.free.State()
+	binary.LittleEndian.PutUint64(data[32:40], state.HeadPage)
+	binary.LittleEndian.PutUint64(data[40:48], state.HeadSeq)
+	binary.LittleEndian.PutUint64(data[48:56], state.TailPage)
+	binary.LittleEndian.PutUint64(data[56:64], state.TailSeq)
 	binary.LittleEndian.PutUint64(data[64:72], db.version)
 	return data[:]
 }
@@ -205,8 +211,7 @@ func readRoot(db *KV, fileSize int64) error {
 		// reserve 2 pages: the meta page and a free list node
 		db.page.flushed = 2
 		// add an initial node to the free list so it's never empty
-		db.free.headPage = 1 // the 2nd page
-		db.free.tailPage = 1
+		db.free.Restore(freelist.State{HeadPage: 1, TailPage: 1})
 		return nil // the meta page will be written in the 1st update
 	}
 	// read the page
@@ -218,10 +223,11 @@ func readRoot(db *KV, fileSize int64) error {
 	bad := !bytes.Equal([]byte(DB_SIG), data[:16])
 	// pointers are within range?
 	maxpages := uint64(fileSize / btree.BTREE_PAGE_SIZE)
+	freeState := db.free.State()
 	bad = bad || !(0 < db.page.flushed && db.page.flushed <= maxpages)
 	bad = bad || !(0 < db.tree.Root && db.tree.Root < db.page.flushed)
-	bad = bad || !(0 < db.free.headPage && db.free.headPage < db.page.flushed)
-	bad = bad || !(0 < db.free.tailPage && db.free.tailPage < db.page.flushed)
+	bad = bad || !(0 < freeState.HeadPage && freeState.HeadPage < db.page.flushed)
+	bad = bad || !(0 < freeState.TailPage && freeState.TailPage < db.page.flushed)
 	if bad {
 		return errors.New("bad meta page")
 	}

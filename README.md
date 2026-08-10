@@ -4,12 +4,14 @@ This repository contains the chapter 13/14 database implementation, split into
 one-way dependency layers:
 
 ```text
-utils -> btree -> kvstore -> table -> ql -> cmd/demo
+utils -> btree -----> kvstore -> table -> ql -> cmd/demo
+          \-> freelist --/
 ```
 
 - `btree/` implements page-oriented B+tree nodes and iterators.
-- `kvstore/` implements files, free-page management, snapshots, and KV
-  transactions.
+- `freelist/` implements the reusable, version-aware queue of free pages.
+- `kvstore/` implements files, snapshots, and KV transactions by composing the
+  B-tree and free list.
 - `table/` implements schemas, records, indexes, and table transactions.
 - `ql/` implements parsing and execution of the query language.
 - `utils/` contains shared internal assertions.

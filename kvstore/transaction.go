@@ -127,8 +127,8 @@ func (kv *KV) Commit(tx *KVTX) error {
 	// save the meta page
 	meta, root := saveMeta(kv), kv.tree.Root
 	// transfer updates to the current tree
-	kv.free.curVer = kv.version + 1 // version in the free list
-	writes := []KeyRange(nil)       // collect updated ranges in this TX
+	kv.free.SetCurrentVersion(kv.version + 1)
+	writes := []KeyRange(nil) // collect updated ranges in this TX
 	for iter := tx.pending.Seek(nil, btree.CMP_GT); iter.Valid(); iter.Next() {
 		modified := false
 		key, val := iter.Deref()

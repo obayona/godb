@@ -1,4 +1,4 @@
-package kvstore
+package freelist
 
 import (
 	"encoding/binary"
@@ -34,6 +34,24 @@ func (node LNode) setItem(idx int, ptr uint64, version uint64) {
 	binary.LittleEndian.PutUint64(node[offset+8:], version)
 }
 
+// PageIO supplies the page operations required by a FreeList. New must append
+// a page, while Set must return writable bytes for an existing page.
+type PageIO struct {
+	Get func(uint64) []byte
+	New func([]byte) uint64
+	Set func(uint64) []byte
+}
+
+// State is the free-list metadata persisted by the owning storage engine.
+type State struct {
+	HeadPage uint64
+	HeadSeq  uint64
+	TailPage uint64
+	TailSeq  uint64
+}
+
+// FreeList stores reusable page pointers in an on-disk, version-aware queue.
+// Its State must be persisted atomically with the storage engine's root page.
 type FreeList struct {
 	// callbacks for managing on-disk pages
 	get func(uint64) []byte // read a page
@@ -50,8 +68,72 @@ type FreeList struct {
 	curVer uint64 // version number when committing
 }
 
+// New creates a free list backed by pages and restores its persisted state.
+func New(pages PageIO, state State) *FreeList {
+	fl := &FreeList{}
+	fl.Configure(pages)
+	fl.Restore(state)
+	return fl
+}
+
+// Configure sets the page operations used by the free list.
+func (fl *FreeList) Configure(pages PageIO) {
+	utils.Assert(pages.Get != nil && pages.New != nil && pages.Set != nil)
+	fl.get = pages.Get
+	fl.new = pages.New
+	fl.set = pages.Set
+}
+
+// Restore replaces the persisted queue position.
+func (fl *FreeList) Restore(state State) {
+	fl.headPage = state.HeadPage
+	fl.headSeq = state.HeadSeq
+	fl.tailPage = state.TailPage
+	fl.tailSeq = state.TailSeq
+}
+
+// State returns the metadata that the owning storage engine must persist.
+func (fl *FreeList) State() State {
+	return State{
+		HeadPage: fl.headPage,
+		HeadSeq:  fl.headSeq,
+		TailPage: fl.tailPage,
+		TailSeq:  fl.tailSeq,
+	}
+}
+
+// PageSets returns the queued reusable pages and the metadata pages that hold
+// the queue. The returned slices are snapshots intended for validation and
+// diagnostics; modifying them does not change the free list.
+func (fl *FreeList) PageSets() (reusable []uint64, metadata []uint64) {
+	ptr := fl.headPage
+	metadata = append(metadata, ptr)
+	for seq := fl.headSeq; seq != fl.tailSeq; {
+		utils.Assert(ptr != 0)
+		node := LNode(fl.get(ptr))
+		item, _ := node.getItem(seq2idx(seq))
+		reusable = append(reusable, item)
+		seq++
+		if seq2idx(seq) == 0 {
+			ptr = node.getNext()
+			metadata = append(metadata, ptr)
+		}
+	}
+	return reusable, metadata
+}
+
+// SetCurrentVersion assigns the version recorded on subsequently freed pages.
+func (fl *FreeList) SetCurrentVersion(version uint64) {
+	fl.curVer = version
+}
+
 func seq2idx(seq uint64) int {
 	return int(seq % FREE_LIST_CAP)
+}
+
+// versionBefore compares wrapping unsigned transaction versions.
+func versionBefore(a, b uint64) bool {
+	return a-b > 1<<63
 }
 
 func (fl *FreeList) check() {
@@ -59,7 +141,7 @@ func (fl *FreeList) check() {
 	utils.Assert(fl.headSeq != fl.tailSeq || fl.headPage == fl.tailPage)
 }
 
-// get 1 item from the list head. return 0 on failure.
+// PopHead returns one reusable page pointer, or zero when none is safe to use.
 func (fl *FreeList) PopHead() uint64 {
 	ptr, head := flPop(fl)
 	if head != 0 { // the empty head node is recycled
@@ -88,7 +170,7 @@ func flPop(fl *FreeList) (ptr uint64, head uint64) {
 	return
 }
 
-// add 1 item to the tail
+// PushTail records a page pointer for reuse by a future safe version.
 func (fl *FreeList) PushTail(ptr uint64) {
 	fl.check()
 	// add it to the tail node
@@ -113,7 +195,7 @@ func (fl *FreeList) PushTail(ptr uint64) {
 	}
 }
 
-// make the newly added items available for consumption
+// SetMaxVer makes newly added items visible and sets the oldest reader version.
 func (fl *FreeList) SetMaxVer(maxVer uint64) {
 	fl.maxSeq = fl.tailSeq
 	fl.maxVer = maxVer

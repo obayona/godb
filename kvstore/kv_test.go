@@ -142,7 +142,7 @@ func (d *D) verify(t *testing.T) {
 	nodeVerify(d.db.tree.GetPage(d.db.tree.Root))
 
 	// free list
-	list, nodes := flDump(&d.db.free)
+	list, nodes := d.db.free.PageSets()
 	for _, ptr := range nodes {
 		is.Zero(t, pages[ptr])
 		pages[ptr] = 2 // free list node
