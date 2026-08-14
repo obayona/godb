@@ -6,20 +6,19 @@ import (
 	"log"
 	"os"
 
-	"github.com/obayona/godb/ql"
-	"github.com/obayona/godb/table"
+	"github.com/obayona/godb/client"
 )
 
 func main() {
 	const path = "demo.db"
 	_ = os.Remove(path)
 
-	database := &table.DB{Path: path}
-	if err := database.Open(); err != nil {
+	database, err := client.Open(path)
+	if err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
-		database.Close()
+		_ = database.Close()
 		_ = os.Remove(path)
 	}()
 
@@ -39,27 +38,15 @@ func main() {
 	}
 
 	for _, statement := range statements {
-		tx := &table.DBTX{}
-		database.Begin(tx)
-		result, err := ql.DBTXExecString(tx, []byte(statement))
+		result, err := database.Query(statement)
 		if err != nil {
-			database.Abort(tx)
 			log.Fatalf("%s: %v", statement, err)
-		}
-		if err := database.Commit(tx); err != nil {
-			log.Fatal(err)
 		}
 
 		fmt.Printf("> %s\n", statement)
 		fmt.Printf("  added=%d updated=%d deleted=%d\n", result.Added, result.Updated, result.Deleted)
-		rows := result.Rows()
-		for rows.Valid() {
-			row, err := rows.Deref()
-			if err != nil {
-				log.Fatal(err)
-			}
+		for _, row := range result.Rows {
 			fmt.Printf("  %s\n", row)
-			rows.Next()
 		}
 	}
 }
